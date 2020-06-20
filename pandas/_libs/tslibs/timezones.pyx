@@ -1,21 +1,13 @@
-# -*- coding: utf-8 -*-
-# cython: profile=False
-
-cimport cython
-from cython cimport Py_ssize_t
+from cpython.datetime cimport tzinfo
+from datetime import timezone
 
 # dateutil compat
 from dateutil.tz import (
-    tzutc as _dateutil_tzutc,
+    gettz as dateutil_gettz,
+    tzfile as _dateutil_tzfile,
     tzlocal as _dateutil_tzlocal,
-    tzfile as _dateutil_tzfile)
-
-import sys
-if sys.platform == 'win32' or sys.platform == 'cygwin':
-    # equiv pd.compat.is_platform_windows()
-    from dateutil.zoneinfo import gettz as _dateutil_gettz
-else:
-    from dateutil.tz import gettz as _dateutil_gettz
+    tzutc as _dateutil_tzutc,
+)
 
 
 from pytz.tzinfo import BaseTzInfo as _pytz_BaseTzInfo
@@ -24,19 +16,21 @@ UTC = pytz.utc
 
 
 import numpy as np
-cimport numpy as np
-from numpy cimport ndarray, int64_t
-np.import_array()
+cimport numpy as cnp
+from numpy cimport int64_t
+cnp.import_array()
 
 # ----------------------------------------------------------------------
-from util cimport is_string_object, is_integer_object, get_nat
+from pandas._libs.tslibs.util cimport is_integer_object, get_nat
 
 cdef int64_t NPY_NAT = get_nat()
+cdef tzinfo utc_stdlib = timezone.utc
+cdef tzinfo utc_pytz = UTC
 
 # ----------------------------------------------------------------------
 
-cdef inline bint is_utc(object tz):
-    return tz is UTC or isinstance(tz, _dateutil_tzutc)
+cpdef inline bint is_utc(object tz):
+    return tz is utc_pytz or tz is utc_stdlib or isinstance(tz, _dateutil_tzutc)
 
 
 cdef inline bint is_tzlocal(object tz):
@@ -44,8 +38,8 @@ cdef inline bint is_tzlocal(object tz):
 
 
 cdef inline bint treat_tz_as_pytz(object tz):
-    return hasattr(tz, '_utc_transition_times') and hasattr(
-        tz, '_transition_info')
+    return (hasattr(tz, '_utc_transition_times') and
+            hasattr(tz, '_transition_info'))
 
 
 cdef inline bint treat_tz_as_dateutil(object tz):
@@ -66,7 +60,7 @@ cpdef inline object get_timezone(object tz):
     UJSON/pytables. maybe_get_tz (below) is the inverse of this process.
     """
     if is_utc(tz):
-        return 'UTC'
+        return tz
     else:
         if treat_tz_as_dateutil(tz):
             if '.tar.gz' in tz._filename:
@@ -95,12 +89,12 @@ cpdef inline object maybe_get_tz(object tz):
     (Maybe) Construct a timezone object from a string. If tz is a string, use
     it to construct a timezone object. Otherwise, just return tz.
     """
-    if is_string_object(tz):
+    if isinstance(tz, str):
         if tz == 'tzlocal()':
             tz = _dateutil_tzlocal()
         elif tz.startswith('dateutil/'):
             zone = tz[9:]
-            tz = _dateutil_gettz(zone)
+            tz = dateutil_gettz(zone)
             # On Python 3 on Windows, the filename is not always set correctly.
             if isinstance(tz, _dateutil_tzfile) and '.tar.gz' in tz._filename:
                 tz._filename = zone
@@ -112,15 +106,17 @@ cpdef inline object maybe_get_tz(object tz):
 
 
 def _p_tz_cache_key(tz):
-    """ Python interface for cache function to facilitate testing."""
-    return _tz_cache_key(tz)
+    """
+    Python interface for cache function to facilitate testing.
+    """
+    return tz_cache_key(tz)
 
 
 # Timezone data caches, key is the pytz string or dateutil file name.
 dst_cache = {}
 
 
-cdef inline object _tz_cache_key(object tz):
+cdef inline object tz_cache_key(object tz):
     """
     Return the key in the cache for the timezone info object or None
     if unknown.
@@ -129,7 +125,7 @@ cdef inline object _tz_cache_key(object tz):
     dateutil timezones.
 
     Notes
-    =====
+    -----
     This cannot just be the hash of a timezone object. Unfortunately, the
     hashes of two dateutil tz objects which represent the same timezone are
     not equal (even though the tz objects will compare equal and represent
@@ -153,17 +149,18 @@ cdef inline object _tz_cache_key(object tz):
         return None
 
 
-#----------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # UTC Offsets
 
-cpdef get_utcoffset(tzinfo, obj):
+
+cdef get_utcoffset(tzinfo tz, obj):
     try:
-        return tzinfo._utcoffset
+        return tz._utcoffset
     except AttributeError:
-        return tzinfo.utcoffset(obj)
+        return tz.utcoffset(obj)
 
 
-cdef inline bint _is_fixed_offset(object tz):
+cdef inline bint is_fixed_offset(tzinfo tz):
     if treat_tz_as_dateutil(tz):
         if len(tz._trans_idx) == 0 and len(tz._trans_list) == 0:
             return 1
@@ -171,14 +168,16 @@ cdef inline bint _is_fixed_offset(object tz):
             return 0
     elif treat_tz_as_pytz(tz):
         if (len(tz._transition_info) == 0
-            and len(tz._utc_transition_times) == 0):
+                and len(tz._utc_transition_times) == 0):
             return 1
         else:
             return 0
+    # This also implicitly accepts datetime.timezone objects which are
+    # considered fixed
     return 1
 
 
-cdef object _get_utc_trans_times_from_dateutil_tz(object tz):
+cdef object _get_utc_trans_times_from_dateutil_tz(tzinfo tz):
     """
     Transition times in dateutil timezones are stored in local non-dst
     time.  This code converts them to UTC. It's the reverse of the code
@@ -193,16 +192,16 @@ cdef object _get_utc_trans_times_from_dateutil_tz(object tz):
     return new_trans
 
 
-cpdef ndarray _unbox_utcoffsets(object transinfo):
+cdef int64_t[:] unbox_utcoffsets(object transinfo):
     cdef:
         Py_ssize_t i, sz
-        ndarray[int64_t] arr
+        int64_t[:] arr
 
     sz = len(transinfo)
     arr = np.empty(sz, dtype='i8')
 
     for i in range(sz):
-        arr[i] = int(transinfo[i][0].total_seconds()) * 1000000000
+        arr[i] = int(transinfo[i][0].total_seconds()) * 1_000_000_000
 
     return arr
 
@@ -211,7 +210,7 @@ cpdef ndarray _unbox_utcoffsets(object transinfo):
 # Daylight Savings
 
 
-cdef object _get_dst_info(object tz):
+cdef object get_dst_info(object tz):
     """
     return a tuple of :
       (UTC times of DST transitions,
@@ -219,9 +218,11 @@ cdef object _get_dst_info(object tz):
        string of type of transitions)
 
     """
-    cache_key = _tz_cache_key(tz)
+    cache_key = tz_cache_key(tz)
     if cache_key is None:
-        num = int(get_utcoffset(tz, None).total_seconds()) * 1000000000
+        # e.g. pytz.FixedOffset, matplotlib.dates._UTC,
+        # psycopg2.tz.FixedOffsetTimezone
+        num = int(get_utcoffset(tz, None).total_seconds()) * 1_000_000_000
         return (np.array([NPY_NAT + 1], dtype=np.int64),
                 np.array([num], dtype=np.int64),
                 None)
@@ -230,12 +231,9 @@ cdef object _get_dst_info(object tz):
         if treat_tz_as_pytz(tz):
             trans = np.array(tz._utc_transition_times, dtype='M8[ns]')
             trans = trans.view('i8')
-            try:
-                if tz._utc_transition_times[0].year == 1:
-                    trans[0] = NPY_NAT + 1
-            except Exception:
-                pass
-            deltas = _unbox_utcoffsets(tz._transition_info)
+            if tz._utc_transition_times[0].year == 1:
+                trans[0] = NPY_NAT + 1
+            deltas = unbox_utcoffsets(tz._transition_info)
             typ = 'pytz'
 
         elif treat_tz_as_dateutil(tz):
@@ -243,7 +241,7 @@ cdef object _get_dst_info(object tz):
                 # get utc trans times
                 trans_list = _get_utc_trans_times_from_dateutil_tz(tz)
                 trans = np.hstack([
-                    np.array([0], dtype='M8[s]'), # place holder for first item
+                    np.array([0], dtype='M8[s]'),  # place holder for 1st item
                     np.array(trans_list, dtype='M8[s]')]).astype(
                     'M8[ns]')  # all trans listed
                 trans = trans.view('i8')
@@ -255,18 +253,24 @@ cdef object _get_dst_info(object tz):
                 deltas *= 1000000000
                 typ = 'dateutil'
 
-            elif _is_fixed_offset(tz):
+            elif is_fixed_offset(tz):
                 trans = np.array([NPY_NAT + 1], dtype=np.int64)
                 deltas = np.array([tz._ttinfo_std.offset],
                                   dtype='i8') * 1000000000
                 typ = 'fixed'
             else:
-                trans = np.array([], dtype='M8[ns]')
-                deltas = np.array([], dtype='i8')
-                typ = None
+                # 2018-07-12 this is not reached in the tests, and this case
+                # is not handled in any of the functions that call
+                # get_dst_info.  If this case _were_ hit the calling
+                # functions would then hit an IndexError because they assume
+                # `deltas` is non-empty.
+                # (under the just-deleted code that returned empty arrays)
+                raise AssertionError("dateutil tzinfo is not a FixedOffset "
+                                     "and has an empty `_trans_list`.", tz)
 
         else:
             # static tzinfo
+            # TODO: This case is not hit in tests (2018-07-17); is it possible?
             trans = np.array([NPY_NAT + 1], dtype=np.int64)
             num = int(get_utcoffset(tz, None).total_seconds()) * 1000000000
             deltas = np.array([num], dtype=np.int64)
@@ -275,3 +279,85 @@ cdef object _get_dst_info(object tz):
         dst_cache[cache_key] = (trans, deltas, typ)
 
     return dst_cache[cache_key]
+
+
+def infer_tzinfo(start, end):
+    if start is not None and end is not None:
+        tz = start.tzinfo
+        if not tz_compare(tz, end.tzinfo):
+            raise AssertionError(f'Inputs must both have the same timezone, '
+                                 f'{tz} != {end.tzinfo}')
+    elif start is not None:
+        tz = start.tzinfo
+    elif end is not None:
+        tz = end.tzinfo
+    else:
+        tz = None
+    return tz
+
+
+cpdef bint tz_compare(object start, object end):
+    """
+    Compare string representations of timezones
+
+    The same timezone can be represented as different instances of
+    timezones. For example
+    `<DstTzInfo 'Europe/Paris' LMT+0:09:00 STD>` and
+    `<DstTzInfo 'Europe/Paris' CET+1:00:00 STD>` are essentially same
+    timezones but aren't evaluated such, but the string representation
+    for both of these is `'Europe/Paris'`.
+
+    This exists only to add a notion of equality to pytz-style zones
+    that is compatible with the notion of equality expected of tzinfo
+    subclasses.
+
+    Parameters
+    ----------
+    start : tzinfo
+    end : tzinfo
+
+    Returns:
+    -------
+    bool
+
+    """
+    # GH 18523
+    return get_timezone(start) == get_timezone(end)
+
+
+def tz_standardize(tz: object):
+    """
+    If the passed tz is a pytz timezone object, "normalize" it to the a
+    consistent version
+
+    Parameters
+    ----------
+    tz : tz object
+
+    Returns:
+    -------
+    tz object
+
+    Examples:
+    --------
+    >>> tz
+    <DstTzInfo 'US/Pacific' PST-1 day, 16:00:00 STD>
+
+    >>> tz_standardize(tz)
+    <DstTzInfo 'US/Pacific' LMT-1 day, 16:07:00 STD>
+
+    >>> tz
+    <DstTzInfo 'US/Pacific' LMT-1 day, 16:07:00 STD>
+
+    >>> tz_standardize(tz)
+    <DstTzInfo 'US/Pacific' LMT-1 day, 16:07:00 STD>
+
+    >>> tz
+    dateutil.tz.tz.tzutc
+
+    >>> tz_standardize(tz)
+    dateutil.tz.tz.tzutc
+    """
+    if treat_tz_as_pytz(tz):
+        return pytz.timezone(str(tz))
+    return tz
